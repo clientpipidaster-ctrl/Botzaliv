@@ -8,6 +8,7 @@
 
 import asyncio
 import base64
+import gc
 import hashlib
 import io
 import json
@@ -95,7 +96,7 @@ class PostgresStorage(BaseStorage):
 
     async def connect(self):
         if self._pool is None:
-            self._pool = await asyncpg.create_pool(self._dsn)
+            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=2, max_inactive_connection_lifetime=60)
             async with self._pool.acquire() as conn:
                 await conn.execute(
                     """
@@ -163,7 +164,7 @@ async def db_init(dsn: str):
     global _pool
     if _pool is not None:
         return
-    _pool = await asyncpg.create_pool(dsn)
+    _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4, max_inactive_connection_lifetime=60)
     async with _pool.acquire() as conn:
         await conn.execute("CREATE TABLE IF NOT EXISTS posts (id SERIAL PRIMARY KEY)")
         await conn.execute("ALTER TABLE posts ADD COLUMN IF NOT EXISTS title TEXT")
@@ -894,6 +895,7 @@ OWNER_COMMANDS = ADMIN_COMMANDS + [
 
 SUPER_OWNER_COMMANDS = OWNER_COMMANDS + [
     BotCommand(command="owner", description="👑 Панель Супер-Владельца"),
+    BotCommand(command="restart", description="🔄 Перезапустить бота"),
     BotCommand(command="update", description="🚀 Обновить bot.py на GitHub"),
 ]
 
@@ -967,8 +969,64 @@ async def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID or user_id == SUPER_OWNER_ID
 
 
+_maint_cache: Optional[bool] = None
+
+
 async def is_maintenance_enabled() -> bool:
-    return await get_setting("maintenance_mode") == "1"
+    global _maint_cache
+    if _maint_cache is not None:
+        return _maint_cache
+    _maint_cache = (await get_setting("maintenance_mode") == "1")
+    return _maint_cache
+
+
+def get_ram_mb() -> int:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 0
+
+
+async def get_auto_restart_hours() -> int:
+    val = await get_setting("auto_restart_hours")
+    if val is None:
+        return 6  # по умолчанию перезапуск каждые 6 часов от лагов хоста
+    try:
+        return int(val)
+    except ValueError:
+        return 6
+
+
+async def trigger_restart(bot: Optional[Bot], reason: str, notify_owner: bool = False):
+    log.warning("Перезапуск бота: %s", reason)
+    if notify_owner and bot:
+        try:
+            await asyncio.wait_for(
+                bot.send_message(
+                    SUPER_OWNER_ID,
+                    f"♻️ <b>Автоперезапуск бота</b>\nПричина: {reason}\nВернётся в строй через 10–15 сек.",
+                    parse_mode=ParseMode.HTML,
+                    disable_notification=True,
+                ),
+                timeout=3.0,
+            )
+        except Exception:
+            pass
+    try:
+        if bot:
+            await asyncio.wait_for(bot.session.close(), timeout=2.0)
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(db_close(), timeout=2.0)
+    except Exception:
+        pass
+    gc.collect()
+    os._exit(1)
 
 
 async def is_admin_logs_enabled() -> bool:
@@ -1273,14 +1331,23 @@ async def _flush_forward(bot: Bot, chat_id: int):
 
 
 # ---------- учёт пользователей ----------
+_touched_cache: Dict[int, float] = {}
+
+
 class TouchUserMiddleware(BaseMiddleware):
     async def __call__(self, handler, event: Message, data: dict):
         if event.from_user and not event.from_user.is_bot:
-            try:
-                await touch_user(event.from_user.id, event.from_user.username)
-            except Exception as e:
-                log.warning("Не смог записать пользователя %s: %s", event.from_user.id, e)
-            if await is_maintenance_enabled() and not await is_admin(event.from_user.id):
+            uid = event.from_user.id
+            now_m = time.monotonic()
+            if now_m - _touched_cache.get(uid, 0.0) > 600:
+                _touched_cache[uid] = now_m
+                if len(_touched_cache) > 5000:
+                    _touched_cache.clear()
+                try:
+                    await touch_user(uid, event.from_user.username)
+                except Exception as e:
+                    log.warning("Не смог записать пользователя %s: %s", uid, e)
+            if await is_maintenance_enabled() and not await is_admin(uid):
                 await event.answer("🛠 Бот сейчас на техническом обслуживании. Попробуй позже.")
                 return
         return await handler(event, data)
@@ -2933,16 +3000,23 @@ async def build_owner_panel() -> Tuple[str, InlineKeyboardMarkup]:
     notify = await is_auto_notify_enabled()
     admlogs = await is_admin_logs_enabled()
     dm_del = await get_dm_autodelete_minutes()
+    auto_rst = await get_auto_restart_hours()
     ads_cnt = len(await list_active_ads())
+    ram_mb = get_ram_mb()
 
     uptime_sec = int(time.monotonic() - BOT_START_TIME)
     h, rem = divmod(uptime_sec, 3600)
     m, s = divmod(rem, 60)
 
     dm_del_str = f"{dm_del} мин" if dm_del > 0 else "ВЫКЛ"
+    auto_rst_str = f"каждые {auto_rst}ч" if auto_rst > 0 else "ВЫКЛ"
+    ram_line = f"🧠 Память RAM: <code>{ram_mb} / 512 МБ</code>\n" if ram_mb > 0 else ""
+
     text = (
         "👑 <b>Панель Супер-Владельца</b>\n\n"
         f"⏱ Аптайм: <code>{h}ч {m}м {s}с</code>\n"
+        f"{ram_line}"
+        f"♻️ Авто-рестарт: <code>{auto_rst_str}</code>\n"
         f"🛠 Техработы: {'✅ ВКЛ' if maint else '❌ ВЫКЛ'}\n"
         f"🛡 Защита контента: {'✅ ВКЛ' if prot else '❌ ВЫКЛ'}\n"
         f"🔒 ОП (.zakrep): {'✅ ВКЛ' if zakrep else '❌ ВЫКЛ'}\n"
@@ -2952,6 +3026,10 @@ async def build_owner_panel() -> Tuple[str, InlineKeyboardMarkup]:
         f"📣 Активной рекламы: <code>{ads_cnt}</code>"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Перезапустить бота", callback_data="own:restart"),
+            InlineKeyboardButton(text=f"♻️ Авто-рестарт: {auto_rst_str}", callback_data="own:cycle_autorestart"),
+        ],
         [
             InlineKeyboardButton(text=f"🛠 Техработы: {'ВКЛ' if maint else 'ВЫКЛ'}", callback_data="own:toggle_maint"),
             InlineKeyboardButton(text=f"🛡 Защита: {'ВКЛ' if prot else 'ВЫКЛ'}", callback_data="own:toggle_prot"),
@@ -2986,6 +3064,14 @@ async def cmd_owner_panel(message: Message):
         return
     text, kb = await build_owner_panel()
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+@router.message(Command("restart"))
+async def cmd_restart_bot(message: Message):
+    if not is_super_owner(message.from_user.id):
+        return
+    await message.answer("♻️ Перезапускаю бота... Через 10–15 секунд он снова в строю!")
+    await trigger_restart(message.bot, "ручной перезапуск командой /restart", notify_owner=False)
 
 @router.message(Command("update"))
 @router.message(F.document & F.caption.startswith("/update"))
@@ -3084,9 +3170,21 @@ async def cb_owner_panel(callback: CallbackQuery):
 
     action = callback.data.split(":", 1)[1]
 
-    if action == "toggle_maint":
+    global _maint_cache
+    if action == "restart":
+        await callback.answer("♻️ Перезапускаю...")
+        await callback.message.answer("♻️ Перезапускаю бота... Через 10–15 секунд он снова в строю!")
+        await trigger_restart(callback.bot, "ручной перезапуск из /owner", notify_owner=False)
+        return
+    elif action == "cycle_autorestart":
+        cur = await get_auto_restart_hours()
+        nxt = {6: 12, 12: 24, 24: 0, 0: 6}.get(cur, 6)
+        await set_setting("auto_restart_hours", str(nxt))
+        await callback.answer(f"♻️ Авто-рестарт: каждые {nxt}ч" if nxt else "♻️ Авто-рестарт: ВЫКЛ")
+    elif action == "toggle_maint":
         new_val = "0" if await is_maintenance_enabled() else "1"
         await set_setting("maintenance_mode", new_val)
+        _maint_cache = (new_val == "1")
         await callback.answer("🛠 Техработы ВКЛ" if new_val == "1" else "✅ Техработы ВЫКЛ")
     elif action == "toggle_prot":
         new_val = "0" if await is_protect_content_enabled() else "1"
@@ -3281,6 +3379,37 @@ async def self_ping_loop():
                 log.warning("Самопинг не удался: %s", e)
 
 
+async def watchdog_and_autorestart_loop(bot: Bot):
+    """Следит за лагами цикла событий, переполнением RAM и плановым автоперезапуском."""
+    high_lag_strikes = 0
+    while True:
+        t0 = time.monotonic()
+        await asyncio.sleep(20)
+        lag = (time.monotonic() - t0) - 20.0
+
+        # 1. Детектор зависаний хоста
+        if lag > 10.0:
+            high_lag_strikes += 1
+            log.warning("Обнаружен лаг цикла событий: %.1f сек (удар %s/3)", lag, high_lag_strikes)
+            if high_lag_strikes >= 3:
+                await trigger_restart(bot, f"зависание хоста (лаг {lag:.1f} сек)", notify_owner=True)
+        else:
+            high_lag_strikes = 0
+
+        # 2. Защита от переполнения памяти на Render Free (512 МБ)
+        ram_mb = get_ram_mb()
+        if ram_mb >= 430:
+            await trigger_restart(bot, f"высокое потребление памяти ({ram_mb} / 512 МБ)", notify_owner=True)
+
+        # 3. Плановый перезапуск по таймеру из /owner
+        try:
+            hours = await get_auto_restart_hours()
+            if hours > 0 and (time.monotonic() - BOT_START_TIME) >= hours * 3600:
+                await trigger_restart(bot, f"плановый перезапуск каждые {hours}ч", notify_owner=True)
+        except Exception as e:
+            log.warning("Ошибка проверки авто-рестарта: %s", e)
+
+
 async def bootstrap_admins():
     for admin_id in BOOTSTRAP_ADMIN_IDS | {SUPER_OWNER_ID}:
         if admin_id and admin_id != OWNER_ID:
@@ -3317,6 +3446,7 @@ async def main():
     try:
         await start_health_server()
         asyncio.create_task(self_ping_loop())
+        asyncio.create_task(watchdog_and_autorestart_loop(bot))
         asyncio.create_task(auto_delete_loop(bot))
         asyncio.create_task(scheduled_posts_loop(bot))
         asyncio.create_task(ads_loop(bot))
