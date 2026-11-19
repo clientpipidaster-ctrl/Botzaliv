@@ -57,7 +57,6 @@ BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "25"))
 AUTO_DELETE_CHECK_INTERVAL = 60
 SCHEDULE_CHECK_INTERVAL = 30
 SELF_PING_INTERVAL = 300
-MAX_BATCH_ITEMS = int(os.getenv("MAX_BATCH_ITEMS", "100"))
 
 # Дефолтное фото пилы для /start (можно заменить своей фоткой командой /setwelcome)
 DEFAULT_WELCOME_PHOTO = os.getenv(
@@ -1128,13 +1127,13 @@ def welcome_keyboard(notify_on: bool) -> InlineKeyboardMarkup:
 
 def stop_keyboard(count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"🛑 Это всё, завершить ({count}/{MAX_BATCH_ITEMS})", callback_data="stop_batch")
+        InlineKeyboardButton(text=f"🛑 Это всё, завершить ({count} шт.)", callback_data="stop_batch")
     ]])
 
 
 def submit_stop_keyboard(count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"🛑 Отправить на проверку ({count}/{MAX_BATCH_ITEMS})", callback_data="stop_submit")
+        InlineKeyboardButton(text=f"🛑 Отправить на проверку ({count} шт.)", callback_data="stop_submit")
     ]])
 
 
@@ -1263,10 +1262,12 @@ async def _flush_forward(bot: Bot, chat_id: int):
     ids = sorted(set(_pending_forward.pop(chat_id, [])))
     if not ids:
         return
-    try:
-        await bot.forward_messages(chat_id=OWNER_ID, from_chat_id=chat_id, message_ids=ids)
-    except TelegramBadRequest as e:
-        log.warning("Не смог переслать пачку владельцу: %s", e)
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        try:
+            await bot.forward_messages(chat_id=OWNER_ID, from_chat_id=chat_id, message_ids=chunk)
+        except TelegramBadRequest as e:
+            log.warning("Не смог переслать пачку владельцу: %s", e)
     for mid in ids:
         await safe_delete(bot, chat_id, mid)
 
@@ -1513,7 +1514,7 @@ async def cb_menu_submit(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Submit.collecting)
     await state.update_data(media=[], status_msg_id=None)
     await callback.message.answer(
-        f"📥 Пришли контент для канала (макс. {MAX_BATCH_ITEMS} файлов). Когда закончишь — жми кнопку или /done."
+        "📥 Пришли контент для канала. Когда закончишь — жми кнопку или /done."
     )
 
 
@@ -2318,7 +2319,7 @@ async def cmd_batch(message: Message, state: FSMContext):
     await state.set_state(Batch.collecting)
     await state.update_data(media=[], status_msg_id=None, submission_id=None, author_name=None, publish_at=None)
     await message.answer(
-        f"📥 Приём начат (макс. {MAX_BATCH_ITEMS} файлов). Кидай контент, потом жми кнопку или /done."
+        "📥 Приём начат. Кидай контент, потом жми кнопку или /done."
     )
 
 
@@ -2349,18 +2350,12 @@ async def collect_media(message: Message, state: FSMContext):
         data = await state.get_data()
         media = data.get("media", [])
 
-        if len(media) >= MAX_BATCH_ITEMS:
-            return
-
         media.append(item)
         status_id = await update_counter(
             message.bot, message.chat.id, data.get("status_msg_id"),
             f"Загружено файлов: {len(media)}. Это всё?", stop_keyboard(len(media)),
         )
         await state.update_data(media=media, status_msg_id=status_id)
-
-        if len(media) == MAX_BATCH_ITEMS:
-            await message.answer(f"⚠️ Лимит {MAX_BATCH_ITEMS} файлов. Жми «Это всё».")
 
     if OWNER_ID and message.from_user.id != OWNER_ID:
         schedule_forward(message.bot, message.chat.id, message.message_id)
@@ -2622,7 +2617,7 @@ async def cmd_submit(message: Message, state: FSMContext):
     await state.set_state(Submit.collecting)
     await state.update_data(media=[], status_msg_id=None)
     await message.answer(
-        f"📥 Пришли контент для канала (макс. {MAX_BATCH_ITEMS} файлов). Когда закончишь — жми кнопку или /done."
+        "📥 Пришли контент для канала. Когда закончишь — жми кнопку или /done."
     )
 
 
@@ -2642,8 +2637,6 @@ async def collect_submission(message: Message, state: FSMContext):
     async with lock:
         data = await state.get_data()
         media = data.get("media", [])
-        if len(media) >= MAX_BATCH_ITEMS:
-            return
         media.append(item)
         status_id = await update_counter(
             message.bot, message.chat.id, data.get("status_msg_id"),
