@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import struct
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -2750,6 +2751,80 @@ def _is_direct_video_url(url: str) -> bool:
     return path.endswith((".mp4", ".mov", ".webm", ".m4v"))
 
 
+def _video_url_priority(url: str) -> Tuple[int, int]:
+    """Приоритет: сначала стандартный .mp4 (H.264), затем .mov/.m4v, в конце .webm и HEVC."""
+    low = url.lower()
+    path = urlparse(low).path
+    is_hevc = int(any(k in low for k in ("hevc", "h265", "h.265", "vp9", "av1")))
+    if path.endswith(".mp4"):
+        ext_rank = 0
+    elif path.endswith((".m4v", ".mov")):
+        ext_rank = 1
+    elif path.endswith(".webm"):
+        ext_rank = 2
+    else:
+        ext_rank = 3
+    return (is_hevc, ext_rank)
+
+
+def _inspect_video_bytes(raw: bytes) -> Dict[str, Any]:
+    """Проверяет, что скачанный файл — реальное видео (а не HTML), и достаёт размеры/кодек."""
+    if len(raw) < 10240:
+        raise RuntimeError("файл слишком маленький (меньше 10 КБ) — сайт отдал заглушку вместо видео")
+
+    head_probe = raw[:1024].lstrip().lower()
+    if (
+        head_probe.startswith((b"<!doctype", b"<html", b"<head", b"<script", b"<?xml", b"{"))
+        or b"<html" in head_probe
+    ):
+        raise RuntimeError("сайт отдал HTML-страницу вместо видеофайла (сработала защита от скачивания)")
+
+    info: Dict[str, Any] = {
+        "container": "unknown",
+        "codec": "unknown",
+        "width": None,
+        "height": None,
+    }
+
+    if len(raw) >= 12 and raw[4:8] == b"ftyp":
+        info["container"] = "mp4"
+        # moov-атом может лежать как в начале, так и в самом конце файла
+        scan = raw[:3 * 1024 * 1024] + (raw[-3 * 1024 * 1024:] if len(raw) > 3 * 1024 * 1024 else b"")
+
+        if b"avc1" in scan or b"avc3" in scan:
+            info["codec"] = "h264"
+        elif b"hvc1" in scan or b"hev1" in scan:
+            info["codec"] = "hevc"
+        elif b"vp09" in scan:
+            info["codec"] = "vp9"
+        elif b"av01" in scan:
+            info["codec"] = "av1"
+
+        # Ищем tkhd (Track Header) видеодорожки для точного width/height
+        pos = 0
+        while True:
+            idx = scan.find(b"tkhd", pos)
+            if idx == -1 or idx < 4:
+                break
+            box_start = idx - 4
+            if box_start + 92 <= len(scan):
+                version = scan[box_start + 8]
+                wh_offset = box_start + (84 if version == 0 else 96)
+                if wh_offset + 8 <= len(scan):
+                    w_fixed, h_fixed = struct.unpack(">II", scan[wh_offset:wh_offset + 8])
+                    w, h = w_fixed >> 16, h_fixed >> 16
+                    if 64 <= w <= 7680 and 64 <= h <= 4320:
+                        info["width"] = w
+                        info["height"] = h
+                        break
+            pos = idx + 4
+    elif raw[:4] == b"\x1a\x45\xdf\xa3":
+        info["container"] = "webm"
+        info["codec"] = "vp8/vp9"
+
+    return info
+
+
 async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
     """Парсит веб-страницу и извлекает ссылки на видео, заголовок и превью."""
     headers = {
@@ -2834,6 +2909,8 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
     for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:mp4|webm|mov|m4v)(?:\?[^\s"\'<>\\]*)?', unescaped_html, re.IGNORECASE):
         add_candidate(m.group(0))
 
+    found.sort(key=_video_url_priority)
+
     return {
         "videos": found[:15],
         "title": title,
@@ -2842,22 +2919,27 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
     }
 
 
-async def _upload_video_from_url(bot: Bot, chat_id: int, video_url: str, page_url: str) -> Message:
-    """Сначала пробует отдать ссылку напрямую в Telegram, при отказе — качает потоком с Referer."""
-    try:
-        return await bot.send_video(chat_id, video=video_url)
-    except Exception:
-        pass
-
+async def _upload_video_from_url(bot: Bot, chat_id: int, video_url: str, page_url: str) -> Tuple[Message, Dict[str, Any]]:
+    """Скачивает видео с правильным Referer, проверяет реальный формат/кодек и грузит со стримингом."""
+    parsed_page = urlparse(page_url or video_url)
+    origin = f"{parsed_page.scheme}://{parsed_page.netloc}" if parsed_page.scheme and parsed_page.netloc else ""
     headers = {
         "User-Agent": BROWSER_UA,
         "Referer": page_url or video_url,
-        "Accept": "*/*",
+        "Accept": "video/mp4,video/webm,video/*;q=0.9,*/*;q=0.5",
     }
+    if origin:
+        headers["Origin"] = origin
+
     async with ClientSession(timeout=ClientTimeout(total=120)) as session:
         async with session.get(video_url, headers=headers, allow_redirects=True) as resp:
             if resp.status >= 400:
                 raise RuntimeError(f"сервер видео ответил {resp.status}")
+
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if ctype.startswith(("text/", "application/json", "application/xml", "application/javascript")):
+                raise RuntimeError(f"сайт вернул {ctype.split(';')[0]} вместо видео (защита от прямых ссылок)")
+
             cl = resp.headers.get("Content-Length")
             if cl and cl.isdigit() and int(cl) > MAX_GRAB_VIDEO_BYTES:
                 mb = round(int(cl) / (1024 * 1024), 1)
@@ -2876,13 +2958,40 @@ async def _upload_video_from_url(bot: Bot, chat_id: int, video_url: str, page_ur
             buf.close()
 
     try:
-        fname = os.path.basename(urlparse(video_url).path) or "video.mp4"
-        if not fname.lower().endswith((".mp4", ".mov", ".webm", ".m4v")):
-            fname += ".mp4"
-        return await bot.send_video(chat_id, video=BufferedInputFile(raw_bytes, filename=fname))
+        vinfo = _inspect_video_bytes(raw_bytes)
+        base_name = os.path.splitext(os.path.basename(urlparse(video_url).path))[0] or "video"
+        ext = ".webm" if vinfo["container"] == "webm" else ".mp4"
+        fname = f"{base_name}{ext}"
+
+        sent = await bot.send_video(
+            chat_id,
+            video=BufferedInputFile(raw_bytes, filename=fname),
+            width=vinfo["width"],
+            height=vinfo["height"],
+            supports_streaming=True,
+        )
+        return sent, vinfo
     finally:
         del raw_bytes
         gc.collect()
+
+
+def _item_from_sent_media(sent: Message) -> Dict[str, Any]:
+    if sent.video:
+        return {"type": "video", "file_id": sent.video.file_id, "msg_id": sent.message_id}
+    if sent.animation:
+        return {"type": "animation", "file_id": sent.animation.file_id, "msg_id": sent.message_id}
+    if sent.document:
+        return {"type": "document", "file_id": sent.document.file_id, "msg_id": sent.message_id}
+    raise RuntimeError("Telegram не принял файл как видео")
+
+
+def _codec_warning_text(vinfo: Dict[str, Any]) -> str:
+    if vinfo.get("container") == "webm":
+        return "\n⚠️ <i>Формат видео WebM — встроенный плеер Telegram на телефоне может его не открыть.</i>"
+    if vinfo.get("codec") in ("hevc", "vp9", "av1"):
+        return f"\n⚠️ <i>Кодек {vinfo['codec'].upper()} — встроенный плеер Telegram на некоторых телефонах может потребовать внешний плеер.</i>"
+    return ""
 
 
 async def _upload_image_from_url(bot: Bot, chat_id: int, img_url: str, page_url: str) -> str:
@@ -2937,18 +3046,20 @@ async def _process_site_link(message: Message, url: str):
     }
 
     if len(videos) == 1:
-        await status.edit_text("⏳ Нашёл видео! Загружаю в Telegram...")
+        await status.edit_text("⏳ Нашёл видео! Проверяю и загружаю в Telegram...")
         try:
-            sent = await _upload_video_from_url(message.bot, chat_id, videos[0], url)
+            sent, vinfo = await _upload_video_from_url(message.bot, chat_id, videos[0], url)
+            item = _item_from_sent_media(sent)
         except Exception as e:
             await status.edit_text(f"❌ Не удалось загрузить видео: {e}")
             return
         await safe_delete(message.bot, chat_id, status.message_id)
-        _grab_cache[chat_id]["items"] = [{"type": "video", "file_id": sent.video.file_id, "msg_id": sent.message_id}]
+        _grab_cache[chat_id]["items"] = [item]
         _grab_cache[chat_id]["preview_msg_ids"] = [sent.message_id]
         title_hint = f"\n📝 Заголовок с сайта: <i>{html_lib.escape(parsed['title'])}</i>" if parsed["title"] else ""
+        codec_warn = _codec_warning_text(vinfo)
         await message.answer(
-            f"✅ <b>Видео готово!</b>{title_hint}\nЧто делаем дальше?",
+            f"✅ <b>Видео готово!</b>{title_hint}{codec_warn}\nЧто делаем дальше?",
             parse_mode=ParseMode.HTML,
             reply_markup=_grab_ready_kb(1),
         )
@@ -3047,16 +3158,18 @@ async def cb_grab_actions(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Неверный номер.", show_alert=True)
             return
         await callback.answer("⏳ Загружаю видео...")
-        await callback.message.edit_text(f"⏳ Загружаю видео #{idx + 1}...")
+        await callback.message.edit_text(f"⏳ Проверяю и загружаю видео #{idx + 1}...")
         try:
-            sent = await _upload_video_from_url(callback.bot, chat_id, videos[idx], entry["page_url"])
+            sent, vinfo = await _upload_video_from_url(callback.bot, chat_id, videos[idx], entry["page_url"])
+            item = _item_from_sent_media(sent)
         except Exception as e:
             await callback.message.edit_text(f"❌ Не удалось загрузить видео #{idx + 1}: {e}")
             return
-        entry["items"] = [{"type": "video", "file_id": sent.video.file_id, "msg_id": sent.message_id}]
+        entry["items"] = [item]
         entry["preview_msg_ids"] = [sent.message_id]
+        codec_warn = _codec_warning_text(vinfo)
         await callback.message.edit_text(
-            "✅ <b>Видео готово!</b>\nЧто делаем дальше?",
+            f"✅ <b>Видео готово!</b>{codec_warn}\nЧто делаем дальше?",
             parse_mode=ParseMode.HTML,
             reply_markup=_grab_ready_kb(1),
         )
@@ -3071,8 +3184,8 @@ async def cb_grab_actions(callback: CallbackQuery, state: FSMContext):
         failed = 0
         for v_url in videos:
             try:
-                sent = await _upload_video_from_url(callback.bot, chat_id, v_url, entry["page_url"])
-                items.append({"type": "video", "file_id": sent.video.file_id, "msg_id": sent.message_id})
+                sent, _ = await _upload_video_from_url(callback.bot, chat_id, v_url, entry["page_url"])
+                items.append(_item_from_sent_media(sent))
                 msg_ids.append(sent.message_id)
             except Exception as e:
                 log.warning("Ошибка загрузки одного из видео (%s): %s", v_url, e)
@@ -3080,12 +3193,12 @@ async def cb_grab_actions(callback: CallbackQuery, state: FSMContext):
             await asyncio.sleep(0.2)
 
         if not items:
-            await callback.message.edit_text("❌ Ни одно видео не удалось загрузить.")
+            await callback.message.edit_text("❌ Ни одно видео не удалось загрузить (возможно, сайт отдаёт защищённые или слишком большие файлы).")
             return
 
         entry["items"] = items
         entry["preview_msg_ids"] = msg_ids
-        warn = f" (не удалось: {failed})" if failed else ""
+        warn = f" (пропущено: {failed})" if failed else ""
         await callback.message.edit_text(
             f"✅ <b>Загружено видео: {len(items)} шт.{warn}</b>\nЧто делаем дальше?",
             parse_mode=ParseMode.HTML,
