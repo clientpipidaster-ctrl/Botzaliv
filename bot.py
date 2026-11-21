@@ -10,6 +10,7 @@ import asyncio
 import base64
 import gc
 import hashlib
+import html as html_lib
 import io
 import json
 import logging
@@ -18,6 +19,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 import asyncpg
 from dotenv import load_dotenv
@@ -864,6 +866,7 @@ USER_COMMANDS = [
 
 ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand(command="batch", description="📥 Загрузить и опубликовать пост"),
+    BotCommand(command="grab", description="🌐 Скачать видео с сайта по ссылке"),
     BotCommand(command="done", description="✅ Завершить загрузку"),
     BotCommand(command="zakrep", description="🔒 Обязательная подписка (мульти-ОП)"),
     BotCommand(command="protect", description="🛡 Защита контента от пересылки"),
@@ -950,6 +953,10 @@ class ReklamaState(StatesGroup):
     waiting_photo = State()
     waiting_schedule = State()
     waiting_channel = State()
+
+
+class GrabState(StatesGroup):
+    waiting_url = State()
 
 
 BATCH_STATES = {
@@ -2456,13 +2463,46 @@ async def finish_collecting(bot: Bot, chat_id: int, from_user, state: FSMContext
     await bot.send_message(chat_id, f"✅ Принято файлов: {len(media)}.\nТеперь пришли *название* поста.", parse_mode=ParseMode.MARKDOWN)
 
 
+def _grab_cover_kb(data: Dict[str, Any]) -> Optional[InlineKeyboardMarkup]:
+    if data.get("grab_cover_url"):
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🖼 Взять обложку с сайта", callback_data="grab_use:cover")
+        ]])
+    return None
+
+
 @router.message(StateFilter(Batch.waiting_title), F.text)
 async def get_title(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
     await state.update_data(title=message.text.strip())
+    data = await state.get_data()
     await state.set_state(Batch.waiting_cover)
-    await message.answer("🖼 Теперь пришли обложку (фото).")
+    await message.answer("🖼 Теперь пришли обложку (фото).", reply_markup=_grab_cover_kb(data))
+
+
+@router.callback_query(F.data == "grab_use:title", StateFilter(Batch.waiting_title))
+async def cb_grab_use_title(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    site_title = data.get("grab_title")
+    if not site_title:
+        await callback.answer("Название с сайта не найдено.", show_alert=True)
+        return
+    await callback.answer("✅ Название взято с сайта")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await state.update_data(title=site_title)
+    await state.set_state(Batch.waiting_cover)
+    await callback.message.answer(
+        f"📝 Название: <b>{html_lib.escape(site_title)}</b>\n\n🖼 Теперь пришли обложку (фото).",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_grab_cover_kb(data),
+    )
 
 
 @router.message(StateFilter(Batch.waiting_cover), F.photo)
@@ -2472,6 +2512,32 @@ async def get_cover(message: Message, state: FSMContext):
     await state.update_data(cover_file_id=message.photo[-1].file_id)
     await state.set_state(Batch.waiting_hashtag)
     await message.answer("#️⃣ Теперь пришли хэштег (например: #видео).")
+
+
+@router.callback_query(F.data == "grab_use:cover", StateFilter(Batch.waiting_cover))
+async def cb_grab_use_cover(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    data = await state.get_data()
+    cover_url = data.get("grab_cover_url")
+    page_url = data.get("grab_page_url", "")
+    if not cover_url:
+        await callback.answer("Обложка с сайта не найдена.", show_alert=True)
+        return
+    await callback.answer("⏳ Загружаю обложку с сайта...")
+    try:
+        file_id = await _upload_image_from_url(callback.bot, callback.message.chat.id, cover_url, page_url)
+    except Exception as e:
+        await callback.message.answer(f"❌ Не смог скачать обложку с сайта ({e}). Пришли фото вручную:")
+        return
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    await state.update_data(cover_file_id=file_id)
+    await state.set_state(Batch.waiting_hashtag)
+    await callback.message.answer("#️⃣ Обложка принята! Теперь пришли хэштег (например: #видео).")
 
 
 @router.message(StateFilter(Batch.waiting_hashtag), F.text)
@@ -2661,6 +2727,433 @@ async def finalize_publish_or_schedule(bot: Bot, chat_id: int, actor_id: int, st
         done_text += "\n🕒 Удалится через 24ч."
     await bot.send_message(chat_id, done_text)
     await state.clear()
+
+
+# =============================================================================
+# 🌐 ПАРСЕР ВИДЕО С САЙТА ПО ССЫЛКЕ (РЕЖИМ 1 — /grab ИЛИ ПРЯМАЯ ССЫЛКА)
+# =============================================================================
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+)
+MAX_GRAB_VIDEO_BYTES = 49 * 1024 * 1024  # 49 МБ (лимит Bot API — 50 МБ)
+_grab_cache: Dict[int, Dict[str, Any]] = {}
+
+
+def _extract_url_from_text(text: str) -> Optional[str]:
+    m = re.search(r"https?://[^\s<>\"']+", text.strip())
+    return m.group(0).rstrip(".,);]") if m else None
+
+
+def _is_direct_video_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith((".mp4", ".mov", ".webm", ".m4v"))
+
+
+async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
+    """Парсит веб-страницу и извлекает ссылки на видео, заголовок и превью."""
+    headers = {
+        "User-Agent": BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": page_url,
+    }
+    if _is_direct_video_url(page_url):
+        return {"videos": [page_url], "title": None, "cover_url": None, "has_hls": False}
+
+    async with ClientSession(timeout=ClientTimeout(total=20)) as session:
+        async with session.get(page_url, headers=headers, allow_redirects=True) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"Сайт вернул код {resp.status}")
+            final_url = str(resp.url)
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if ctype.startswith("video/") or _is_direct_video_url(final_url):
+                return {"videos": [final_url], "title": None, "cover_url": None, "has_hls": False}
+            raw = await resp.content.read(2 * 1024 * 1024)
+            html_text = raw.decode("utf-8", errors="ignore")
+
+    # 1. Заголовок страницы
+    title = None
+    for pat in (
+        r'<meta[^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:title|twitter:title)["\']',
+        r"<title[^>]*>(.*?)</title>",
+    ):
+        m = re.search(pat, html_text, re.IGNORECASE | re.DOTALL)
+        if m:
+            cleaned = re.sub(r"\s+", " ", html_lib.unescape(m.group(1))).strip()
+            if cleaned:
+                title = cleaned[:120]
+                break
+
+    # 2. Обложка (poster / og:image)
+    cover_url = None
+    for pat in (
+        r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\']',
+        r'<video[^>]+poster=["\']([^"\']+)["\']',
+    ):
+        m = re.search(pat, html_text, re.IGNORECASE)
+        if m:
+            cand = html_lib.unescape(m.group(1).strip())
+            if cand and not cand.startswith("data:"):
+                cover_url = urljoin(final_url, cand)
+                break
+
+    # 3. Поиск видеофайлов
+    found: List[str] = []
+    seen = set()
+    has_hls = bool(re.search(r"\.m3u8(?:\?|\b)", html_text, re.IGNORECASE))
+
+    def add_candidate(raw_u: str):
+        u = html_lib.unescape(raw_u).replace("\\/", "/").strip()
+        if not u or u.startswith(("data:", "blob:", "javascript:")):
+            return
+        full = urljoin(final_url, u)
+        low = full.lower()
+        if ".m3u8" in low or ".mpd" in low:
+            return
+        if full not in seen:
+            seen.add(full)
+            found.append(full)
+
+    # OpenGraph / Twitter meta video
+    for pat in (
+        r'<meta[^>]+(?:property|name)=["\'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["\']',
+    ):
+        for m in re.finditer(pat, html_text, re.IGNORECASE):
+            add_candidate(m.group(1))
+
+    # <video src="..."> и <source src="...">
+    for m in re.finditer(r'<(?:video|source)[^>]+src=["\']([^"\']+)["\']', html_text, re.IGNORECASE):
+        add_candidate(m.group(1))
+
+    # Прямые ссылки на .mp4 / .webm / .mov / .m4v в скриптах и JSON-LD
+    unescaped_html = html_text.replace("\\/", "/")
+    for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:mp4|webm|mov|m4v)(?:\?[^\s"\'<>\\]*)?', unescaped_html, re.IGNORECASE):
+        add_candidate(m.group(0))
+
+    return {
+        "videos": found[:15],
+        "title": title,
+        "cover_url": cover_url,
+        "has_hls": has_hls,
+    }
+
+
+async def _upload_video_from_url(bot: Bot, chat_id: int, video_url: str, page_url: str) -> Message:
+    """Сначала пробует отдать ссылку напрямую в Telegram, при отказе — качает потоком с Referer."""
+    try:
+        return await bot.send_video(chat_id, video=video_url)
+    except Exception:
+        pass
+
+    headers = {
+        "User-Agent": BROWSER_UA,
+        "Referer": page_url or video_url,
+        "Accept": "*/*",
+    }
+    async with ClientSession(timeout=ClientTimeout(total=120)) as session:
+        async with session.get(video_url, headers=headers, allow_redirects=True) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"сервер видео ответил {resp.status}")
+            cl = resp.headers.get("Content-Length")
+            if cl and cl.isdigit() and int(cl) > MAX_GRAB_VIDEO_BYTES:
+                mb = round(int(cl) / (1024 * 1024), 1)
+                raise RuntimeError(f"видео весит {mb} МБ (лимит Telegram для ботов — 50 МБ)")
+
+            buf = io.BytesIO()
+            total = 0
+            async for chunk in resp.content.iter_chunked(256 * 1024):
+                total += len(chunk)
+                if total > MAX_GRAB_VIDEO_BYTES:
+                    buf.close()
+                    raise RuntimeError("видео больше 50 МБ (лимит Telegram для ботов)")
+                buf.write(chunk)
+
+            raw_bytes = buf.getvalue()
+            buf.close()
+
+    try:
+        fname = os.path.basename(urlparse(video_url).path) or "video.mp4"
+        if not fname.lower().endswith((".mp4", ".mov", ".webm", ".m4v")):
+            fname += ".mp4"
+        return await bot.send_video(chat_id, video=BufferedInputFile(raw_bytes, filename=fname))
+    finally:
+        del raw_bytes
+        gc.collect()
+
+
+async def _upload_image_from_url(bot: Bot, chat_id: int, img_url: str, page_url: str) -> str:
+    headers = {"User-Agent": BROWSER_UA, "Referer": page_url or img_url}
+    async with ClientSession(timeout=ClientTimeout(total=20)) as session:
+        async with session.get(img_url, headers=headers, allow_redirects=True) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"код {resp.status}")
+            raw = await resp.content.read(10 * 1024 * 1024)
+    sent = await bot.send_photo(chat_id, photo=BufferedInputFile(raw, filename="cover.jpg"))
+    file_id = sent.photo[-1].file_id
+    await safe_delete(bot, chat_id, sent.message_id)
+    return file_id
+
+
+def _grab_ready_kb(count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🚀 Опубликовать в канал ({count} шт.)", callback_data="grab:pub")],
+        [InlineKeyboardButton(text="➕ Добавить в копилку /batch", callback_data="grab:to_batch")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="grab:cancel")],
+    ])
+
+
+async def _process_site_link(message: Message, url: str):
+    chat_id = message.chat.id
+    status = await message.answer("🔍 Сканирую страницу и ищу видео...")
+    try:
+        parsed = await parse_site_video_page(url)
+    except Exception as e:
+        await status.edit_text(f"❌ Не удалось открыть страницу: {e}")
+        return
+
+    videos = parsed["videos"]
+    if not videos:
+        if parsed["has_hls"]:
+            await status.edit_text(
+                "⚠️ На этой странице видео отдаётся потоком <code>.m3u8</code> (HLS), "
+                "прямого <code>.mp4</code> файла нет — Telegram Bot API не принимает потоковые плейлисты.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await status.edit_text("❌ Прямых видеофайлов на этой странице не найдено (возможно, сайт защищён капчей или авторизацией).")
+        return
+
+    _grab_cache[chat_id] = {
+        "page_url": url,
+        "videos": videos,
+        "title": parsed["title"],
+        "cover_url": parsed["cover_url"],
+        "items": [],
+        "preview_msg_ids": [],
+    }
+
+    if len(videos) == 1:
+        await status.edit_text("⏳ Нашёл видео! Загружаю в Telegram...")
+        try:
+            sent = await _upload_video_from_url(message.bot, chat_id, videos[0], url)
+        except Exception as e:
+            await status.edit_text(f"❌ Не удалось загрузить видео: {e}")
+            return
+        await safe_delete(message.bot, chat_id, status.message_id)
+        _grab_cache[chat_id]["items"] = [{"type": "video", "file_id": sent.video.file_id, "msg_id": sent.message_id}]
+        _grab_cache[chat_id]["preview_msg_ids"] = [sent.message_id]
+        title_hint = f"\n📝 Заголовок с сайта: <i>{html_lib.escape(parsed['title'])}</i>" if parsed["title"] else ""
+        await message.answer(
+            f"✅ <b>Видео готово!</b>{title_hint}\nЧто делаем дальше?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_grab_ready_kb(1),
+        )
+        return
+
+    # Найдено несколько видео на странице
+    rows = []
+    row = []
+    for idx in range(len(videos)):
+        row.append(InlineKeyboardButton(text=f"🎬 Видео #{idx + 1}", callback_data=f"grab:pick:{idx}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text=f"📥 Забрать все ({len(videos)} шт.)", callback_data="grab:pick_all")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="grab:cancel")])
+
+    await status.edit_text(
+        f"🎬 На странице найдено видео: <b>{len(videos)} шт.</b>\nВыбери нужное или забери все сразу:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.message(Command("grab"))
+async def cmd_grab(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    url = _extract_url_from_text(message.text)
+    if url:
+        await _process_site_link(message, url)
+        return
+    await state.set_state(GrabState.waiting_url)
+    await message.answer("🌐 Пришли ссылку на страницу с видео:")
+
+
+@router.message(StateFilter(GrabState.waiting_url), F.text)
+async def handle_grab_url_state(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    if message.text.startswith("/"):
+        await state.clear()
+        return
+    url = _extract_url_from_text(message.text)
+    if not url:
+        await message.answer("❌ Не вижу ссылки. Пришли URL вида <code>https://...</code> или /cancel.", parse_mode=ParseMode.HTML)
+        return
+    await state.clear()
+    await _process_site_link(message, url)
+
+
+@router.message(StateFilter(None), F.chat.type == ChatType.PRIVATE, F.text.regexp(r"https?://"))
+async def auto_grab_link_in_pm(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+    if message.text.startswith("/") or message.text.startswith("."):
+        return
+    url = _extract_url_from_text(message.text)
+    if not url:
+        return
+    host = urlparse(url).netloc.lower()
+    if host in ("t.me", "telegram.me", "telegram.dog"):
+        return
+    await _process_site_link(message, url)
+
+
+@router.callback_query(F.data.startswith("grab:"))
+async def cb_grab_actions(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Только для админов.", show_alert=True)
+        return
+
+    chat_id = callback.message.chat.id
+    entry = _grab_cache.get(chat_id)
+    parts = callback.data.split(":")
+    action = parts[1]
+
+    if action == "cancel":
+        await callback.answer("Отменено.")
+        if entry:
+            for mid in entry.get("preview_msg_ids", []):
+                await safe_delete(callback.bot, chat_id, mid)
+            _grab_cache.pop(chat_id, None)
+        await safe_delete(callback.bot, chat_id, callback.message.message_id)
+        return
+
+    if not entry:
+        await callback.answer("Сессия устарела, отправь ссылку заново.", show_alert=True)
+        return
+
+    if action == "pick":
+        idx = int(parts[2])
+        videos = entry["videos"]
+        if idx < 0 or idx >= len(videos):
+            await callback.answer("Неверный номер.", show_alert=True)
+            return
+        await callback.answer("⏳ Загружаю видео...")
+        await callback.message.edit_text(f"⏳ Загружаю видео #{idx + 1}...")
+        try:
+            sent = await _upload_video_from_url(callback.bot, chat_id, videos[idx], entry["page_url"])
+        except Exception as e:
+            await callback.message.edit_text(f"❌ Не удалось загрузить видео #{idx + 1}: {e}")
+            return
+        entry["items"] = [{"type": "video", "file_id": sent.video.file_id, "msg_id": sent.message_id}]
+        entry["preview_msg_ids"] = [sent.message_id]
+        await callback.message.edit_text(
+            "✅ <b>Видео готово!</b>\nЧто делаем дальше?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_grab_ready_kb(1),
+        )
+        return
+
+    if action == "pick_all":
+        videos = entry["videos"]
+        await callback.answer("⏳ Загружаю все видео...")
+        await callback.message.edit_text(f"⏳ Загружаю {len(videos)} видео с сайта...")
+        items = []
+        msg_ids = []
+        failed = 0
+        for v_url in videos:
+            try:
+                sent = await _upload_video_from_url(callback.bot, chat_id, v_url, entry["page_url"])
+                items.append({"type": "video", "file_id": sent.video.file_id, "msg_id": sent.message_id})
+                msg_ids.append(sent.message_id)
+            except Exception as e:
+                log.warning("Ошибка загрузки одного из видео (%s): %s", v_url, e)
+                failed += 1
+            await asyncio.sleep(0.2)
+
+        if not items:
+            await callback.message.edit_text("❌ Ни одно видео не удалось загрузить.")
+            return
+
+        entry["items"] = items
+        entry["preview_msg_ids"] = msg_ids
+        warn = f" (не удалось: {failed})" if failed else ""
+        await callback.message.edit_text(
+            f"✅ <b>Загружено видео: {len(items)} шт.{warn}</b>\nЧто делаем дальше?",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_grab_ready_kb(len(items)),
+        )
+        return
+
+    if action == "to_batch":
+        items = entry.get("items", [])
+        if not items:
+            await callback.answer("Сначала выбери видео.", show_alert=True)
+            return
+        await callback.answer("➕ Добавлено в /batch!")
+        for mid in entry.get("preview_msg_ids", []):
+            await safe_delete(callback.bot, chat_id, mid)
+        _grab_cache.pop(chat_id, None)
+        await safe_delete(callback.bot, chat_id, callback.message.message_id)
+
+        cur_state = await state.get_state()
+        data = await state.get_data()
+        media = data.get("media", []) if cur_state == Batch.collecting.state else []
+        media.extend(items)
+        await state.set_state(Batch.collecting)
+        status_id = await update_counter(
+            callback.bot, chat_id, data.get("status_msg_id") if cur_state == Batch.collecting.state else None,
+            f"Загружено файлов: {len(media)}. Кидай ещё или жми «Это всё».",
+            stop_keyboard(len(media)),
+        )
+        await state.update_data(media=media, status_msg_id=status_id)
+        return
+
+    if action == "pub":
+        items = entry.get("items", [])
+        if not items:
+            await callback.answer("Сначала выбери видео.", show_alert=True)
+            return
+        await callback.answer()
+        for mid in entry.get("preview_msg_ids", []):
+            await safe_delete(callback.bot, chat_id, mid)
+        await safe_delete(callback.bot, chat_id, callback.message.message_id)
+        _grab_cache.pop(chat_id, None)
+
+        await state.clear()
+        await state.update_data(
+            media=items,
+            admin_id=callback.from_user.id,
+            admin_name=callback.from_user.full_name,
+            submission_id=None,
+            author_name=None,
+            publish_at=None,
+            grab_title=entry.get("title"),
+            grab_cover_url=entry.get("cover_url"),
+            grab_page_url=entry.get("page_url"),
+        )
+        await state.set_state(Batch.waiting_title)
+
+        kb = None
+        if entry.get("title"):
+            short_t = entry["title"][:32]
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"📝 Взять: «{short_t}»", callback_data="grab_use:title")
+            ]])
+        await callback.bot.send_message(
+            chat_id,
+            f"✅ Принято видео: {len(items)} шт.\nТеперь пришли *название* поста (или нажми кнопку ниже):",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb,
+        )
 
 
 # =============================================================================
