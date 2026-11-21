@@ -2731,7 +2731,7 @@ async def finalize_publish_or_schedule(bot: Bot, chat_id: int, actor_id: int, st
 
 
 # =============================================================================
-# 🌐 ПАРСЕР ВИДЕО С САЙТА ПО ССЫЛКЕ (РЕЖИМ 1 — /grab ИЛИ ПРЯМАЯ ССЫЛКА)
+# 🌐 ПАРСЕР ВИДЕО С САЙТА ПО ССЫЛКЕ И HTML-КОДУ (РЕЖИМ 1 — /grab)
 # =============================================================================
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -2746,14 +2746,25 @@ _AD_IFRAME_HOSTS = (
     "twitter.com/widgets", "addthis", "sharethis", "recaptcha", "hcaptcha",
 )
 
+_HTML_EMBED_RE = re.compile(r"<(?:iframe|video|source|embed|object)\b", re.IGNORECASE)
+
+
+def _looks_like_html_embed(text: str) -> bool:
+    return bool(_HTML_EMBED_RE.search(text or ""))
+
 
 def _extract_url_from_text(text: str) -> Optional[str]:
     m = re.search(r"https?://[^\s<>\"']+", text.strip())
-    return m.group(0).rstrip(".,);]") if m else None
+    if m:
+        return m.group(0).rstrip(".,);]")
+    m_proto = re.search(r"(?:src|href)=[\"'](//[^\s\"']+)[\"']", text, re.IGNORECASE)
+    if m_proto:
+        return "https:" + m_proto.group(1)
+    return None
 
 
 def _is_direct_video_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
+    path = urlparse(url).path.lower().rstrip("/")
     return path.endswith((".mp4", ".mov", ".webm", ".m4v"))
 
 
@@ -2774,7 +2785,7 @@ def _root_site_url(url: str) -> str:
 def _video_url_priority(url: str) -> Tuple[int, int]:
     """Приоритет: сначала стандартный .mp4 (H.264), затем .mov/.m4v, в конце .webm и HEVC."""
     low = url.lower()
-    path = urlparse(low).path
+    path = urlparse(low).path.rstrip("/")
     is_hevc = int(any(k in low for k in ("hevc", "h265", "h.265", "vp9", "av1")))
     if path.endswith(".mp4"):
         ext_rank = 0
@@ -2804,7 +2815,11 @@ def _extract_videos_from_html(html_text: str, base_url: str) -> Tuple[List[str],
         u = html_lib.unescape(raw_u).replace("\\/", "/").strip()
         if not u or u.startswith(("data:", "blob:", "javascript:", "#")):
             return
-        full = urljoin(base_url, u)
+        if u.startswith("//"):
+            u = "https:" + u
+        full = urljoin(base_url, u) if base_url else u
+        if not full.startswith(("http://", "https://")):
+            return
         low = full.lower()
         if ".m3u8" in low or ".mpd" in low:
             return
@@ -2826,7 +2841,7 @@ def _extract_videos_from_html(html_text: str, base_url: str) -> Tuple[List[str],
 
     # 3. Атрибуты data-video / data-mp4 / data-file / href на видеофайлы
     for m in re.finditer(
-        r'(?:data-(?:video|mp4|file|stream|source|src)|href)=["\']([^"\']+?\.(?:mp4|webm|mov|m4v)(?:\?[^"\']*)?)["\']',
+        r'(?:data-(?:video|mp4|file|stream|source|src)|href)=["\']([^"\']+?\.(?:mp4|webm|mov|m4v)(?:/|\?[^"\']*)?)["\']',
         html_text,
         re.IGNORECASE,
     ):
@@ -2835,27 +2850,27 @@ def _extract_videos_from_html(html_text: str, base_url: str) -> Tuple[List[str],
     # 4. Абсолютные, протокол-относительные (//...) и относительные (/...) пути к видео в JS/JSON
     unescaped_html = html_text.replace("\\/", "/")
     for m in re.finditer(
-        r'(?:https?:)?//[^\s"\'<>\\]+?\.(?:mp4|webm|mov|m4v)(?:\?[^\s"\'<>\\]*)?',
+        r'(?:https?:)?//[^\s"\'<>\\]+?\.(?:mp4|webm|mov|m4v)(?:/|\?[^\s"\'<>\\]*)?',
         unescaped_html,
         re.IGNORECASE,
     ):
         add_candidate(m.group(0))
 
     for m in re.finditer(
-        r'["\'](/[a-zA-Z0-9_./\-]+?\.(?:mp4|webm|mov|m4v)(?:\?[^"\']*)?)["\']',
+        r'["\'](/[a-zA-Z0-9_./\-]+?\.(?:mp4|webm|mov|m4v)(?:/|\?[^"\']*)?)["\']',
         unescaped_html,
         re.IGNORECASE,
     ):
         add_candidate(m.group(1))
 
-    # 5. Ключи видеоплееров в JSON/JS ("video_url", "contentUrl", "file", "mp4", "hd", "sd")
+    # 5. Ключи видеоплееров в JSON/JS ("video_url", "mp4", "hd", "sd", "file", "src")
     for m in re.finditer(
-        r'["\'](?:video_url|videoUrl|contentUrl|mp4|hd|sd|file|src)["\']\s*:\s*["\']((?:https?:)?//[^"\']+?|/[^"\']+?)["\']',
+        r'["\'](?:video_url|videoUrl|mp4|hd|sd|file|src|stream_url|streamUrl)["\']\s*:\s*["\']((?:https?:)?//[^"\']+?|/[^"\']+?)["\']',
         unescaped_html,
         re.IGNORECASE,
     ):
         cand = m.group(1)
-        if any(ext in cand.lower() for ext in (".mp4", ".webm", ".mov", ".m4v", "/video", "/get_file", "/stream", "/media")):
+        if any(ext in cand.lower() for ext in (".mp4", ".webm", ".mov", ".m4v", "/get_file", "/stream", "/media")):
             add_candidate(cand)
 
     return found, has_hls
@@ -2868,7 +2883,11 @@ def _extract_iframe_urls(html_text: str, base_url: str) -> List[str]:
         raw_u = html_lib.unescape(m.group(1)).strip()
         if not raw_u or raw_u.startswith(("about:", "javascript:", "data:")):
             continue
-        full = urljoin(base_url, raw_u)
+        if raw_u.startswith("//"):
+            raw_u = "https:" + raw_u
+        full = urljoin(base_url, raw_u) if base_url else raw_u
+        if not full.startswith(("http://", "https://")):
+            continue
         low = full.lower()
         if any(ad in low for ad in _AD_IFRAME_HOSTS):
             continue
@@ -2966,7 +2985,7 @@ def _inspect_video_bytes(raw: bytes) -> Dict[str, Any]:
         head_probe.startswith((b"<!doctype", b"<html", b"<head", b"<script", b"<?xml", b"{"))
         or b"<html" in head_probe
     ):
-        raise RuntimeError("сайт отдал HTML-страницу вместо видеофайла (сработала защита от скачивания)")
+        raise RuntimeError("сайт отдал HTML-страницу вместо видеофайла")
 
     info: Dict[str, Any] = {
         "container": "unknown",
@@ -3019,6 +3038,52 @@ def _dump_cookie_jar(jar: CookieJar) -> Dict[str, str]:
     return cookies
 
 
+async def parse_html_embed_snippet(snippet: str) -> Dict[str, Any]:
+    """Разбирает HTML-код для вставки («Поделиться HTML-кодом»): <iframe ...> или <video ...>."""
+    # 1. Ищем прямые <video>/<source> прямо внутри вставленного HTML-кода
+    direct_vids, has_hls = _extract_videos_from_html(snippet, "")
+
+    title = None
+    m_title = re.search(r'\btitle=["\']([^"\']+)["\']', snippet, re.IGNORECASE)
+    if m_title:
+        title = html_lib.unescape(m_title.group(1)).strip()[:120] or None
+
+    cover_url = None
+    m_poster = re.search(r'\bposter=["\']([^"\']+)["\']', snippet, re.IGNORECASE)
+    if m_poster:
+        p_u = html_lib.unescape(m_poster.group(1)).strip()
+        if p_u.startswith("//"):
+            p_u = "https:" + p_u
+        if p_u.startswith(("http://", "https://")):
+            cover_url = p_u
+
+    iframes = _extract_iframe_urls(snippet, "")
+    embed_url = iframes[0] if iframes else (_extract_url_from_text(snippet) or "")
+
+    if direct_vids:
+        direct_vids.sort(key=_video_url_priority)
+        return {
+            "videos": direct_vids[:15],
+            "title": title,
+            "cover_url": cover_url,
+            "has_hls": has_hls,
+            "cookies": {},
+            "ytdlp_headers": {},
+            "source_url": embed_url or direct_vids[0],
+        }
+
+    if embed_url:
+        parsed = await parse_site_video_page(embed_url)
+        if title and not parsed.get("title"):
+            parsed["title"] = title
+        if cover_url and not parsed.get("cover_url"):
+            parsed["cover_url"] = cover_url
+        parsed["source_url"] = embed_url
+        return parsed
+
+    raise RuntimeError("в переданном HTML-коде не найдено ни ссылки на видео, ни <iframe> плеера")
+
+
 async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
     """Парсит веб-страницу (и вложенные iframe), сохраняя cookies сессии."""
     jar = CookieJar(unsafe=True)
@@ -3033,7 +3098,6 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
         headers["Referer"] = root_ref
 
     if _is_direct_video_url(page_url):
-        # Прогреваем сессию корнем сайта, чтобы получить anti-hotlink cookies, если они нужны
         if root_ref:
             try:
                 async with ClientSession(cookie_jar=jar, timeout=ClientTimeout(total=10)) as s:
@@ -3048,6 +3112,7 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
             "has_hls": False,
             "cookies": _dump_cookie_jar(jar),
             "ytdlp_headers": {},
+            "source_url": page_url,
         }
 
     html_text = ""
@@ -3070,11 +3135,11 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
                             "has_hls": False,
                             "cookies": _dump_cookie_jar(jar),
                             "ytdlp_headers": {},
+                            "source_url": final_url,
                         }
                     raw = await resp.content.read(2 * 1024 * 1024)
                     html_text = raw.decode("utf-8", errors="ignore")
 
-            # Если на основной странице видео не нашлось, проверяем вложенные <iframe> плееры
             if html_text:
                 found, has_hls = _extract_videos_from_html(html_text, final_url)
                 if not found:
@@ -3104,7 +3169,6 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
         fetch_err = str(e)
         found, has_hls = [], False
 
-    # 1. Заголовок страницы
     title = None
     if html_text:
         for pat in (
@@ -3119,7 +3183,6 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
                     title = cleaned[:120]
                     break
 
-    # 2. Обложка (poster / og:image)
     cover_url = None
     if html_text:
         for pat in (
@@ -3134,7 +3197,6 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
                     cover_url = urljoin(final_url, cand)
                     break
 
-    # 3. Если обычный парсер не нашёл видео (или сайт отдал 403/JS-плеер), пробуем yt-dlp
     ytdlp_headers: Dict[str, Dict[str, str]] = {}
     if not found:
         yt_res = await asyncio.to_thread(_extract_with_ytdlp_sync, page_url)
@@ -3155,31 +3217,43 @@ async def parse_site_video_page(page_url: str) -> Dict[str, Any]:
         "has_hls": has_hls,
         "cookies": _dump_cookie_jar(jar),
         "ytdlp_headers": ytdlp_headers,
+        "source_url": final_url,
     }
 
 
-def _extract_redirect_from_html_interstitial(html_text: str, base_url: str) -> Optional[str]:
-    """Если сервер вернул HTML-страницу редиректа/заглушки, пытается вытащить из неё прямую ссылку на видео."""
-    # <meta http-equiv="refresh" content="0;url=...">
+def _extract_redirect_from_html_interstitial(html_text: str, base_url: str, exclude_url: str = "") -> Optional[str]:
+    """Если сервер вернул HTML-страницу плеера/редиректа, вытаскивает из неё прямую ссылку на видео."""
     m = re.search(
         r'<meta[^>]+http-equiv=["\']refresh["\'][^>]+content=["\'][^"\']*?url=([^"\'>\s]+)',
         html_text,
         re.IGNORECASE,
     )
     if m:
-        return urljoin(base_url, html_lib.unescape(m.group(1).strip()))
+        cand = urljoin(base_url, html_lib.unescape(m.group(1).strip()))
+        if cand != exclude_url:
+            return cand
 
-    # window.location / location.href
     m = re.search(
-        r'(?:window\.)?location(?:\.href)?\s*=\s*["\']([^"\']+?\.(?:mp4|webm|mov|m4v)(?:\?[^"\']*)?)["\']',
+        r'(?:window\.)?location(?:\.href)?\s*=\s*["\']([^"\']+?\.(?:mp4|webm|mov|m4v)(?:/|\?[^"\']*)?)["\']',
         html_text,
         re.IGNORECASE,
     )
     if m:
-        return urljoin(base_url, html_lib.unescape(m.group(1).strip()))
+        cand = urljoin(base_url, html_lib.unescape(m.group(1).strip()))
+        if cand != exclude_url:
+            return cand
 
     vids, _ = _extract_videos_from_html(html_text, base_url)
-    return vids[0] if vids else None
+    for v in vids:
+        if v != exclude_url and v != base_url:
+            return v
+
+    iframes = _extract_iframe_urls(html_text, base_url)
+    for ifr in iframes:
+        if ifr != exclude_url and ifr != base_url:
+            return ifr
+
+    return None
 
 
 async def _download_video_bytes_with_retries(
@@ -3188,7 +3262,7 @@ async def _download_video_bytes_with_retries(
     saved_cookies: Optional[Dict[str, str]] = None,
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> bytes:
-    """Скачивает видео, подбирая Referer и cookies сессии при защите от прямых ссылок."""
+    """Скачивает видео, подбирая Referer, cookies сессии и разворачивая HTML-плееры."""
     jar = CookieJar(unsafe=True)
     if saved_cookies:
         jar.update_cookies(saved_cookies)
@@ -3196,10 +3270,6 @@ async def _download_video_bytes_with_retries(
     root_ref = _root_site_url(page_url or video_url)
     video_root_ref = _root_site_url(video_url)
 
-    # Строим список стратегий заголовков:
-    # 1) Referer = страница поста (или корень домена, если юзер кинул прямую ссылку на .mp4)
-    # 2) Прогрев страницы/корня для получения свежих cookies + Referer
-    # 3) Запрос без Referer (для CDN, которые блокируют чужой Referer, но пускают прямой переход)
     primary_ref = page_url if (page_url and page_url != video_url) else (root_ref or video_root_ref)
     strategies: List[Tuple[str, Optional[str], bool]] = [
         ("page_ref", primary_ref, False),
@@ -3209,7 +3279,7 @@ async def _download_video_bytes_with_retries(
     strategies.append(("warmup_cookies", primary_ref, True))
     strategies.append(("no_ref", None, False))
 
-    last_diag = "сайт вернул text/html вместо видео (защита от прямых ссылок)"
+    last_diag = "сайт вернул text/html вместо видео"
     current_url = video_url
 
     async with ClientSession(cookie_jar=jar, timeout=ClientTimeout(total=120)) as session:
@@ -3252,11 +3322,12 @@ async def _download_video_bytes_with_retries(
                 ctype = resp.headers.get("Content-Type", "").lower()
                 if ctype.startswith(("text/", "application/json", "application/xml", "application/javascript")):
                     html_probe = (await resp.content.read(512 * 1024)).decode("utf-8", errors="ignore")
-                    unwrapped = _extract_redirect_from_html_interstitial(html_probe, str(resp.url))
+                    unwrapped = _extract_redirect_from_html_interstitial(html_probe, str(resp.url), exclude_url=current_url)
                     if unwrapped and unwrapped != current_url:
+                        inner_headers = dict(headers)
+                        inner_headers["Referer"] = str(resp.url)
                         current_url = unwrapped
-                        # Пробуем сразу скачать развёрнутую ссылку с тем же Referer
-                        async with session.get(current_url, headers=headers, allow_redirects=True) as resp2:
+                        async with session.get(current_url, headers=inner_headers, allow_redirects=True) as resp2:
                             ctype2 = resp2.headers.get("Content-Type", "").lower()
                             if resp2.status < 400 and not ctype2.startswith(("text/", "application/json")):
                                 resp = resp2
@@ -3287,7 +3358,6 @@ async def _download_video_bytes_with_retries(
                 raw_bytes = buf.getvalue()
                 buf.close()
 
-                # Проверяем сигнатуру; если внутри всё же оказался HTML, пробуем следующую стратегию
                 head_probe = raw_bytes[:1024].lstrip().lower()
                 if head_probe.startswith((b"<!doctype", b"<html", b"<head")) or b"<html" in head_probe:
                     html_title = _extract_html_title(raw_bytes[:65536].decode("utf-8", errors="ignore"))
@@ -3313,7 +3383,7 @@ async def _upload_video_from_url(
     )
     try:
         vinfo = _inspect_video_bytes(raw_bytes)
-        base_name = os.path.splitext(os.path.basename(urlparse(video_url).path))[0] or "video"
+        base_name = os.path.splitext(os.path.basename(urlparse(video_url).path.rstrip("/")))[0] or "video"
         ext = ".webm" if vinfo["container"] == "webm" else ".mp4"
         fname = f"{base_name}{ext}"
 
@@ -3369,32 +3439,42 @@ def _grab_ready_kb(count: int) -> InlineKeyboardMarkup:
     ])
 
 
-async def _process_site_link(message: Message, url: str):
+async def _process_site_input(message: Message, raw_input: str):
     chat_id = message.chat.id
-    status = await message.answer("🔍 Сканирую страницу и ищу видео...")
+    is_html = _looks_like_html_embed(raw_input)
+    status = await message.answer("🔍 Разбираю HTML-код плеера..." if is_html else "🔍 Сканирую страницу и ищу видео...")
     try:
-        parsed = await parse_site_video_page(url)
+        if is_html:
+            parsed = await parse_html_embed_snippet(raw_input)
+            source_url = parsed.get("source_url") or ""
+        else:
+            url = _extract_url_from_text(raw_input)
+            if not url:
+                await status.edit_text("❌ Не вижу ссылки или HTML-кода плеера.")
+                return
+            parsed = await parse_site_video_page(url)
+            source_url = parsed.get("source_url") or url
     except Exception as e:
-        await status.edit_text(f"❌ Не удалось открыть страницу: {e}")
+        await status.edit_text(f"❌ Не удалось обработать: {e}")
         return
 
     videos = parsed["videos"]
     if not videos:
-        if parsed["has_hls"]:
+        if parsed.get("has_hls"):
             await status.edit_text(
                 "⚠️ На этой странице видео отдаётся потоком <code>.m3u8</code> (HLS), "
                 "прямого <code>.mp4</code> файла нет — Telegram Bot API не принимает потоковые плейлисты.",
                 parse_mode=ParseMode.HTML,
             )
         else:
-            await status.edit_text("❌ Прямых видеофайлов на этой странице не найдено (возможно, сайт подгружает плеер через JS или защищён антиботом).")
+            await status.edit_text("❌ Прямых видеофайлов не найдено (возможно, сайт подгружает плеер через JS или защищён антиботом).")
         return
 
     saved_cookies = parsed.get("cookies") or {}
     ytdlp_headers = parsed.get("ytdlp_headers") or {}
 
     _grab_cache[chat_id] = {
-        "page_url": url,
+        "page_url": source_url,
         "videos": videos,
         "title": parsed["title"],
         "cover_url": parsed["cover_url"],
@@ -3411,7 +3491,7 @@ async def _process_site_link(message: Message, url: str):
                 message.bot,
                 chat_id,
                 videos[0],
-                url,
+                source_url,
                 saved_cookies=saved_cookies,
                 extra_headers=ytdlp_headers.get(videos[0]),
             )
@@ -3431,7 +3511,6 @@ async def _process_site_link(message: Message, url: str):
         )
         return
 
-    # Найдено несколько видео на странице
     rows = []
     row = []
     for idx in range(len(videos)):
@@ -3445,7 +3524,7 @@ async def _process_site_link(message: Message, url: str):
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="grab:cancel")])
 
     await status.edit_text(
-        f"🎬 На странице найдено видео: <b>{len(videos)} шт.</b>\nВыбери нужное или забери все сразу:",
+        f"🎬 Найдено видео: <b>{len(videos)} шт.</b>\nВыбери нужное или забери все сразу:",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
@@ -3455,12 +3534,12 @@ async def _process_site_link(message: Message, url: str):
 async def cmd_grab(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
-    url = _extract_url_from_text(message.text)
-    if url:
-        await _process_site_link(message, url)
+    rest = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) > 1 else ""
+    if rest and (_looks_like_html_embed(rest) or _extract_url_from_text(rest)):
+        await _process_site_input(message, rest)
         return
     await state.set_state(GrabState.waiting_url)
-    await message.answer("🌐 Пришли ссылку на страницу с видео:")
+    await message.answer("🌐 Пришли ссылку на страницу с видео или HTML-код для вставки (<code>&lt;iframe ...&gt;</code>):", parse_mode=ParseMode.HTML)
 
 
 @router.message(StateFilter(GrabState.waiting_url), F.text)
@@ -3470,27 +3549,31 @@ async def handle_grab_url_state(message: Message, state: FSMContext):
     if message.text.startswith("/"):
         await state.clear()
         return
-    url = _extract_url_from_text(message.text)
-    if not url:
-        await message.answer("❌ Не вижу ссылки. Пришли URL вида <code>https://...</code> или /cancel.", parse_mode=ParseMode.HTML)
+    raw = message.text.strip()
+    if not (_looks_like_html_embed(raw) or _extract_url_from_text(raw)):
+        await message.answer("❌ Не вижу ссылки или HTML-кода плеера. Пришли URL <code>https://...</code>, код <code>&lt;iframe ...&gt;</code> или /cancel.", parse_mode=ParseMode.HTML)
         return
     await state.clear()
-    await _process_site_link(message, url)
+    await _process_site_input(message, raw)
 
 
-@router.message(StateFilter(None), F.chat.type == ChatType.PRIVATE, F.text.regexp(r"https?://"))
+@router.message(StateFilter(None), F.chat.type == ChatType.PRIVATE, F.text.regexp(r"https?://|<(?:iframe|video|source|embed|object)\b"))
 async def auto_grab_link_in_pm(message: Message):
     if not await is_admin(message.from_user.id):
         return
     if message.text.startswith("/") or message.text.startswith("."):
         return
-    url = _extract_url_from_text(message.text)
+    raw = message.text.strip()
+    if _looks_like_html_embed(raw):
+        await _process_site_input(message, raw)
+        return
+    url = _extract_url_from_text(raw)
     if not url:
         return
     host = urlparse(url).netloc.lower()
     if host in ("t.me", "telegram.me", "telegram.dog"):
         return
-    await _process_site_link(message, url)
+    await _process_site_input(message, raw)
 
 
 @router.callback_query(F.data.startswith("grab:"))
