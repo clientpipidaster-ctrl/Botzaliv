@@ -961,6 +961,7 @@ class ReklamaState(StatesGroup):
 
 class GrabState(StatesGroup):
     waiting_url = State()
+    collecting_urls = State()
 
 
 BATCH_STATES = {
@@ -2410,6 +2411,10 @@ async def cmd_done(message: Message, state: FSMContext):
         await finish_collecting(message.bot, message.chat.id, message.from_user, state)
     elif current == Submit.collecting.state:
         await start_submission_metadata(message.bot, message.chat.id, message.from_user, state)
+    elif current == GrabState.collecting_urls.state:
+        if not await is_admin(message.from_user.id):
+            return
+        await _start_multi_grab_from_state(message.bot, message.chat.id, state)
 
 
 @router.message(StateFilter(Batch.collecting), F.content_type.in_(ACCEPTED_TYPES))
@@ -2741,6 +2746,7 @@ BROWSER_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 MAX_GRAB_VIDEO_BYTES = 49 * 1024 * 1024  # 49 МБ (лимит Bot API — 50 МБ)
+MAX_MULTI_GRAB_URLS = 20
 _grab_cache: Dict[int, Dict[str, Any]] = {}
 
 _AD_IFRAME_HOSTS = (
@@ -2775,6 +2781,23 @@ def _extract_url_from_text(text: str) -> Optional[str]:
     if m_proto:
         return "https:" + m_proto.group(1)
     return None
+
+
+def _extract_all_urls_from_text(text: str, skip_telegram: bool = True) -> List[str]:
+    urls: List[str] = []
+    seen = set()
+    for m in re.finditer(r"https?://[^\s<>\"']+", text or ""):
+        u = m.group(0).rstrip(".,);]")
+        if not u:
+            continue
+        if skip_telegram:
+            host = urlparse(u).netloc.lower()
+            if host in ("t.me", "telegram.me", "telegram.dog"):
+                continue
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls
 
 
 def _is_direct_video_url(url: str) -> bool:
@@ -3746,16 +3769,216 @@ async def _process_site_input(message: Message, raw_input: str):
     )
 
 
+def _grab_mode_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Одна ссылка (или HTML-код)", callback_data="grab_mode:single")],
+        [InlineKeyboardButton(text="📚 Несколько ссылок (пачкой)", callback_data="grab_mode:multi")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="grab_mode:cancel")],
+    ])
+
+
+def _grab_multi_collect_kb(count: int) -> InlineKeyboardMarkup:
+    rows = []
+    if count > 0:
+        rows.append([InlineKeyboardButton(text=f"📥 Скачать все ({count} шт.)", callback_data="grab_multi:start")])
+        rows.append([
+            InlineKeyboardButton(text="🧹 Очистить", callback_data="grab_multi:clear"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="grab_multi:cancel"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="grab_multi:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _update_multi_grab_status(bot: Bot, chat_id: int, status_msg_id: Optional[int], urls: List[str]) -> int:
+    if not urls:
+        text = (
+            "📚 <b>Пакетная загрузка по ссылкам</b>\n\n"
+            "Присылай ссылки на страницы с видео (можно по одной или сразу списком в одном сообщении).\n"
+            "Когда добавишь все ссылки — нажми <b>«Скачать все»</b> или отправь /done."
+        )
+    else:
+        preview_lines = "\n".join(f"{i}. <code>{html_lib.escape(u[:55])}</code>" for i, u in enumerate(urls[:10], 1))
+        if len(urls) > 10:
+            preview_lines += f"\n<i>...и ещё {len(urls) - 10} шт.</i>"
+        text = (
+            f"📚 <b>Добавлено ссылок: {len(urls)} шт.</b> (лимит {MAX_MULTI_GRAB_URLS})\n\n"
+            f"{preview_lines}\n\n"
+            "Присылай ещё ссылки или нажми кнопку ниже, чтобы начать скачивание:"
+        )
+    kb = _grab_multi_collect_kb(len(urls))
+    if status_msg_id:
+        try:
+            msg = await bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg_id, parse_mode=ParseMode.HTML, reply_markup=kb)
+            return msg.message_id
+        except TelegramBadRequest:
+            pass
+    msg = await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    return msg.message_id
+
+
+async def _process_multi_grab(bot: Bot, chat_id: int, urls: List[str], old_status_msg_id: Optional[int] = None):
+    if old_status_msg_id:
+        await safe_delete(bot, chat_id, old_status_msg_id)
+
+    urls = urls[:MAX_MULTI_GRAB_URLS]
+    status_msg = await bot.send_message(
+        chat_id,
+        f"⏳ Начинаю пакетную загрузку (<b>{len(urls)}</b> ссылок)...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    collected_items: List[Dict[str, Any]] = []
+    preview_msg_ids: List[int] = []
+    errors: List[str] = []
+    first_title: Optional[str] = None
+    first_cover_url: Optional[str] = None
+    first_page_url: Optional[str] = None
+
+    for idx, url in enumerate(urls, 1):
+        try:
+            await status_msg.edit_text(
+                f"⏳ Обрабатываю ссылку <b>{idx} из {len(urls)}</b>...\n"
+                f"🔗 <code>{html_lib.escape(url[:60])}</code>\n\n"
+                f"✅ Скачано: <b>{len(collected_items)}</b> | ❌ Ошибок: <b>{len(errors)}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramBadRequest:
+            pass
+
+        try:
+            parsed = await parse_site_video_page(url)
+            videos = parsed.get("videos") or []
+            if not videos:
+                raise RuntimeError("видео на странице не найдено")
+
+            temp_entry = {
+                "page_url": parsed.get("source_url") or url,
+                "videos": videos,
+                "title": parsed.get("title"),
+                "cover_url": parsed.get("cover_url"),
+                "cookies": parsed.get("cookies") or {},
+                "ytdlp_headers": parsed.get("ytdlp_headers") or {},
+                "ytdlp_tried": parsed.get("ytdlp_tried", False),
+            }
+            sent, _ = await _upload_video_with_fallback(bot, chat_id, videos[0], temp_entry)
+            item = _item_from_sent_media(sent)
+            collected_items.append(item)
+            preview_msg_ids.append(sent.message_id)
+
+            if first_title is None and temp_entry.get("title"):
+                first_title = temp_entry["title"]
+            if first_cover_url is None and temp_entry.get("cover_url"):
+                first_cover_url = temp_entry["cover_url"]
+            if first_page_url is None:
+                first_page_url = temp_entry["page_url"]
+        except Exception as e:
+            err_str = html_lib.escape(str(e)[:90])
+            errors.append(f"• Ссылка #{idx}: {err_str}")
+
+        gc.collect()
+        await asyncio.sleep(0.3)
+
+    await safe_delete(bot, chat_id, status_msg.message_id)
+
+    if not collected_items:
+        err_block = "\n".join(errors[:10])
+        await bot.send_message(
+            chat_id,
+            f"❌ <b>Ни одно видео не удалось скачать.</b>\n\n{err_block}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    _grab_cache[chat_id] = {
+        "page_url": first_page_url or urls[0],
+        "videos": [],
+        "title": first_title,
+        "cover_url": first_cover_url,
+        "cookies": {},
+        "ytdlp_headers": {},
+        "ytdlp_tried": True,
+        "items": collected_items,
+        "preview_msg_ids": preview_msg_ids,
+    }
+
+    summary = [f"✅ <b>Пакетная загрузка завершена!</b>\nСкачано видео: <b>{len(collected_items)} из {len(urls)}</b>"]
+    if errors:
+        err_preview = "\n".join(errors[:8])
+        if len(errors) > 8:
+            err_preview += f"\n<i>...и ещё {len(errors) - 8} ошибок</i>"
+        summary.append(f"⚠️ <b>Не удалось скачать ({len(errors)}):</b>\n{err_preview}")
+    summary.append("Что делаем дальше с этими видео?")
+
+    await bot.send_message(
+        chat_id,
+        "\n\n".join(summary),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_grab_ready_kb(len(collected_items)),
+    )
+
+
+async def _start_multi_grab_from_state(bot: Bot, chat_id: int, state: FSMContext):
+    data = await state.get_data()
+    urls = data.get("grab_urls", [])
+    status_msg_id = data.get("grab_status_msg_id")
+    if not urls:
+        await bot.send_message(chat_id, "❌ Список ссылок пуст. Сначала пришли хотя бы одну ссылку.")
+        return
+    await state.clear()
+    await _process_multi_grab(bot, chat_id, urls, old_status_msg_id=status_msg_id)
+
+
 @router.message(Command("grab"))
 async def cmd_grab(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
+    await state.clear()
     rest = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) > 1 else ""
-    if rest and (_looks_like_html_embed(rest) or _extract_url_from_text(rest)):
-        await _process_site_input(message, rest)
+    if rest:
+        if _looks_like_html_embed(rest):
+            await _process_site_input(message, rest)
+            return
+        urls = _extract_all_urls_from_text(rest, skip_telegram=False)
+        if len(urls) >= 2:
+            await _process_multi_grab(message.bot, message.chat.id, urls)
+            return
+        if len(urls) == 1:
+            await _process_site_input(message, rest)
+            return
+
+    await message.answer(
+        "🌐 <b>Загрузка видео с сайтов</b>\n\nВыбери режим загрузки:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_grab_mode_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("grab_mode:"))
+async def cb_grab_mode(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Только для админов.", show_alert=True)
         return
-    await state.set_state(GrabState.waiting_url)
-    await message.answer("🌐 Пришли ссылку на страницу с видео или HTML-код для вставки (<code>&lt;iframe ...&gt;</code>):", parse_mode=ParseMode.HTML)
+
+    mode = callback.data.split(":", 1)[1]
+    await callback.answer()
+    if mode == "cancel":
+        await state.clear()
+        await safe_delete(callback.bot, callback.message.chat.id, callback.message.message_id)
+        return
+    if mode == "single":
+        await state.clear()
+        await state.set_state(GrabState.waiting_url)
+        await callback.message.edit_text(
+            "🌐 Пришли ссылку на страницу с видео или HTML-код для вставки (<code>&lt;iframe ...&gt;</code>):",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if mode == "multi":
+        await state.clear()
+        await state.set_state(GrabState.collecting_urls)
+        await state.update_data(grab_urls=[], grab_status_msg_id=callback.message.message_id)
+        await _update_multi_grab_status(callback.bot, callback.message.chat.id, callback.message.message_id, [])
 
 
 @router.message(StateFilter(GrabState.waiting_url), F.text)
@@ -3773,6 +3996,64 @@ async def handle_grab_url_state(message: Message, state: FSMContext):
     await _process_site_input(message, raw)
 
 
+@router.message(StateFilter(GrabState.collecting_urls), F.text)
+async def handle_grab_multi_urls(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    if message.text.startswith("/") or message.text.startswith("."):
+        return
+
+    found_urls = _extract_all_urls_from_text(message.text, skip_telegram=True)
+    if not found_urls:
+        await message.answer("❌ Ссылок не найдено. Пришли ссылки (http:// или https://), нажми «Скачать все» или /cancel.")
+        return
+
+    lock = get_batch_lock(message.chat.id)
+    async with lock:
+        data = await state.get_data()
+        urls: List[str] = list(data.get("grab_urls", []))
+        for u in found_urls:
+            if u not in urls and len(urls) < MAX_MULTI_GRAB_URLS:
+                urls.append(u)
+        status_id = await _update_multi_grab_status(
+            message.bot, message.chat.id, data.get("grab_status_msg_id"), urls
+        )
+        await state.update_data(grab_urls=urls, grab_status_msg_id=status_id)
+
+
+@router.callback_query(F.data.startswith("grab_multi:"))
+async def cb_grab_multi_actions(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("Только для админов.", show_alert=True)
+        return
+
+    action = callback.data.split(":", 1)[1]
+    chat_id = callback.message.chat.id
+
+    if action == "cancel":
+        await callback.answer("Отменено.")
+        await state.clear()
+        await safe_delete(callback.bot, chat_id, callback.message.message_id)
+        return
+
+    if action == "clear":
+        await callback.answer("Список ссылок очищен.")
+        await state.set_state(GrabState.collecting_urls)
+        await state.update_data(grab_urls=[], grab_status_msg_id=callback.message.message_id)
+        await _update_multi_grab_status(callback.bot, chat_id, callback.message.message_id, [])
+        return
+
+    if action == "start":
+        data = await state.get_data()
+        urls = data.get("grab_urls", [])
+        if not urls:
+            await callback.answer("Сначала отправь хотя бы одну ссылку!", show_alert=True)
+            return
+        await callback.answer("🚀 Начинаю загрузку!")
+        await state.clear()
+        await _process_multi_grab(callback.bot, chat_id, urls, old_status_msg_id=callback.message.message_id)
+
+
 @router.message(StateFilter(None), F.chat.type == ChatType.PRIVATE, F.text.regexp(r"https?://|<(?:iframe|video|source|embed|object)\b"))
 async def auto_grab_link_in_pm(message: Message):
     if not await is_admin(message.from_user.id):
@@ -3783,11 +4064,11 @@ async def auto_grab_link_in_pm(message: Message):
     if _looks_like_html_embed(raw):
         await _process_site_input(message, raw)
         return
-    url = _extract_url_from_text(raw)
-    if not url:
+    urls = _extract_all_urls_from_text(raw, skip_telegram=True)
+    if not urls:
         return
-    host = urlparse(url).netloc.lower()
-    if host in ("t.me", "telegram.me", "telegram.dog"):
+    if len(urls) >= 2:
+        await _process_multi_grab(message.bot, message.chat.id, urls)
         return
     await _process_site_input(message, raw)
 
